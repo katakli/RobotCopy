@@ -202,7 +202,7 @@ def rsync_komutu(kaynak, hedef, mir=True, fft=True, z=True, eta=True,
     if z:
         komut += ["--partial"]
     if eta and not arka_plan:
-        komut += ["--info=progress2"]
+        komut += ["--info=progress1"]   # dosya başına yüzde ve hız
     if not arka_plan:
         komut += ["--info=stats2"]   # rapordaki "değişmeyen" sayısı için toplam dosya sayısı
     if log_yolu:
@@ -493,7 +493,7 @@ class RobotCopyGUI:
         self.opt_mir = tk.BooleanVar(value=True)   # --delete
         self.opt_fft = tk.BooleanVar(value=True)   # --modify-window=2
         self.opt_z   = tk.BooleanVar(value=True)   # --partial
-        self.opt_eta = tk.BooleanVar(value=True)   # --info=progress2
+        self.opt_eta = tk.BooleanVar(value=True)   # --info=progress1 (dosya başına)
         self.opt_log = tk.BooleanVar(value=True)
 
         self.islemiyor = False
@@ -1147,6 +1147,8 @@ class RobotCopyGUI:
                 komut, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
             fd = self.proses.stdout.fileno()
             tampon = ""
+            self._dosya_say = ""
+            self._ilr_aktif = False
             self.sayac = {"yeni": 0, "guncel": 0, "silinen": 0, "toplam": None, "veri": None}
             while True:
                 veri = os.read(fd, 4096)
@@ -1182,7 +1184,7 @@ class RobotCopyGUI:
                         simge, renk = {"yeni": ("+ yeni      ", GREEN),
                                        "guncel": ("~ güncel    ", ORANGE),
                                        "silinen": ("- silindi   ", RED)}[tur]
-                        self.root.after(0, self._yaz, simge + ad + "\n", renk)
+                        self.root.after(0, self._yaz_dosya, simge + ad, renk, tur != "silinen")
                     elif re.match(r"^[<>ch.]d\S{9} ", satir):
                         self.root.after(0, self._yaz, "  klasör     " + satir[12:] + "\n", FG2)
                     else:
@@ -1193,27 +1195,58 @@ class RobotCopyGUI:
             self.root.after(0, self._yaz, f"[HATA] {e}\n", RED)
             self.root.after(0, self._bitis, -99)
 
+    def _yaz_dosya(self, metin, renk, ilerlemeli):
+        """Dosya satırını yazar; ilerlemeli ise satırın sonu canlı yüzde için işaretlenir."""
+        self._yaz(metin, renk)
+        self.cikti.config(state=tk.NORMAL)
+        if ilerlemeli:
+            self.cikti.mark_set("ilr", "end-1c")
+            self.cikti.mark_gravity("ilr", tk.LEFT)
+            self._ilr_aktif = True
+        else:
+            self._ilr_aktif = False
+        self.cikti.insert(tk.END, "\n")
+        self.cikti.config(state=tk.DISABLED)
+
     def _ilerleme(self, satir):
-        m = re.search(r"(\d+)%", satir)
-        yuzde = f"%{m.group(1)}  ·  " if m else ""
+        m = re.match(r"^\s*([\d.,]+\S*?)\s+(\d+)%\s+(\S+/s)\s+(\S+)(?:.*to-chk=(\d+)/(\d+))?", satir)
+        if not m:
+            return
+        boyut, yuzde, hiz, sure, kalan, toplam = m.groups()
+        # Satırın sonundaki yüzde: dosya kopyalandıkça canlı güncellenir
+        if getattr(self, "_ilr_aktif", False):
+            tam = int(yuzde) >= 100
+            self.cikti.config(state=tk.NORMAL)
+            self.cikti.delete("ilr", "ilr lineend")
+            self.cikti.tag_configure("ilr_gri", foreground=FG2)
+            self.cikti.tag_configure("ilr_yesil", foreground=GREEN)
+            self.cikti.insert("ilr", f"   %{yuzde}  {boyut}  {hiz}", "ilr_yesil" if tam else "ilr_gri")
+            self.cikti.config(state=tk.DISABLED)
+            if tam:
+                self._ilr_aktif = False
         c = getattr(self, "sayac", None) or {}
-        self.durum_var.set(f"{yuzde}yeni {c.get('yeni', 0)} · güncellenen {c.get('guncel', 0)}"
-                           f" · silinen {c.get('silinen', 0)}   |   {satir}")
+        if kalan is not None and toplam and int(toplam):
+            self._dosya_say = f"  ·  işlenen {int(toplam) - int(kalan)}/{toplam}"
+        self.durum_var.set(f"%{yuzde}  ·  {hiz}  ·  kalan {sure}{getattr(self, '_dosya_say', '')}"
+                           f"   |   yeni {c.get('yeni', 0)} · güncellenen {c.get('guncel', 0)}"
+                           f" · silinen {c.get('silinen', 0)}")
 
     def _rapor_yaz(self):
         c = getattr(self, "sayac", None)
         if not c:
             return
         toplam = c["yeni"] + c["guncel"] + c["silinen"]
-        self._yaz("\n── RAPOR ─────────────────────────\n", FG2)
-        self._yaz(f"  Yeni (hedefe eklendi)       : {c['yeni']}\n", GREEN)
-        self._yaz(f"  Güncellenen (değişti)       : {c['guncel']}\n", ORANGE)
+        satirlar = [("Yeni (hedefe eklendi)", c["yeni"], GREEN),
+                    ("Güncellenen (değişti)", c["guncel"], ORANGE)]
         if c.get("toplam") is not None:
-            degismeyen = max(0, c["toplam"] - c["yeni"] - c["guncel"])
-            self._yaz(f"  Değişmeyen (aynı kaldı)    : {degismeyen}\n", FG)
-        self._yaz(f"  Silinen (hedefte fazlaydı) : {c['silinen']}\n", RED)
+            satirlar.append(("Değişmeyen (aynı kaldı)", max(0, c["toplam"] - c["yeni"] - c["guncel"]), FG))
+        satirlar.append(("Silinen (hedefte fazlaydı)", c["silinen"], RED))
         if c.get("veri"):
-            self._yaz(f"  Aktarılan veri            : {c['veri']}B\n", FG2)
+            satirlar.append(("Aktarılan veri", f"{c['veri']}B", FG2))
+        gen = max(len(a) for a, _, _ in satirlar)
+        self._yaz("\n── RAPOR ─────────────────────────\n", FG2)
+        for ad, deger, renk in satirlar:
+            self._yaz(f"  {ad.ljust(gen)} : {deger}\n", renk)
         if toplam == 0:
             self._yaz("  Değişiklik yok: hedef kaynakla aynı.\n", FG2)
         self._yaz("──────────────────────────────────\n", FG2)
