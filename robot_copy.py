@@ -203,6 +203,8 @@ def rsync_komutu(kaynak, hedef, mir=True, fft=True, z=True, eta=True,
         komut += ["--partial"]
     if eta and not arka_plan:
         komut += ["--info=progress2"]
+    if not arka_plan:
+        komut += ["--info=stats2"]   # rapordaki "değişmeyen" sayısı için toplam dosya sayısı
     if log_yolu:
         komut += [f"--log-file={log_yolu}"]
     if arka_plan and uzak_mi(hedef):
@@ -1145,7 +1147,7 @@ class RobotCopyGUI:
                 komut, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
             fd = self.proses.stdout.fileno()
             tampon = ""
-            self.sayac = {"yeni": 0, "guncel": 0, "silinen": 0}
+            self.sayac = {"yeni": 0, "guncel": 0, "silinen": 0, "toplam": None, "veri": None}
             while True:
                 veri = os.read(fd, 4096)
                 if not veri:
@@ -1163,6 +1165,16 @@ class RobotCopyGUI:
                     if re.match(r"^\s*[\d.,]+[KMGTkmgt]?B?\s+\d+%", satir):
                         self.root.after(0, self._ilerleme, satir.strip())
                         continue
+                    m = re.match(r"^Number of files: ([\d.,]+)(?: \(reg: ([\d.,]+))?", satir)
+                    if m:
+                        self.sayac["toplam"] = int((m.group(2) or m.group(1)).replace(",", "").replace(".", ""))
+                        continue
+                    m = re.match(r"^Total transferred file size: (.+?) bytes", satir)
+                    if m:
+                        self.sayac["veri"] = m.group(1)
+                        continue
+                    if re.match(r"^(Number of |Total file size|Literal data|Matched data|File list |Total bytes )", satir):
+                        continue   # ayrıntılı istatistik: rapora yalnızca gerekenler alınır
                     cozum = satir_coz(satir)
                     if cozum:
                         tur, ad = cozum
@@ -1194,9 +1206,14 @@ class RobotCopyGUI:
             return
         toplam = c["yeni"] + c["guncel"] + c["silinen"]
         self._yaz("\n── RAPOR ─────────────────────────\n", FG2)
-        self._yaz(f"  Kopyalanan (yeni) dosya : {c['yeni']}\n", GREEN)
-        self._yaz(f"  Güncellenen dosya       : {c['guncel']}\n", ORANGE)
-        self._yaz(f"  Silinen dosya           : {c['silinen']}\n", RED)
+        self._yaz(f"  Yeni (hedefe eklendi)       : {c['yeni']}\n", GREEN)
+        self._yaz(f"  Güncellenen (değişti)       : {c['guncel']}\n", ORANGE)
+        if c.get("toplam") is not None:
+            degismeyen = max(0, c["toplam"] - c["yeni"] - c["guncel"])
+            self._yaz(f"  Değişmeyen (aynı kaldı)    : {degismeyen}\n", FG)
+        self._yaz(f"  Silinen (hedefte fazlaydı) : {c['silinen']}\n", RED)
+        if c.get("veri"):
+            self._yaz(f"  Aktarılan veri            : {c['veri']}B\n", FG2)
         if toplam == 0:
             self._yaz("  Değişiklik yok: hedef kaynakla aynı.\n", FG2)
         self._yaz("──────────────────────────────────\n", FG2)
