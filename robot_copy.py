@@ -252,16 +252,25 @@ def satir_coz(satir):
 
 
 def fs_turu(yol):
-    """Yolun bulunduğu dosya sisteminin türü (ör. ext4, cifs); bilinmiyorsa ''."""
-    yol = os.path.abspath(yol)
-    while not os.path.exists(yol) and os.path.dirname(yol) != yol:
-        yol = os.path.dirname(yol)
+    """Yolun bulunduğu dosya sisteminin türü (ör. ext4, cifs); bilinmiyorsa ''.
+    Yalnızca /proc/self/mountinfo okunur, yola hiç dokunulmaz: yavaş ya da kopmuş
+    bir ağ paylaşımında bile anında döner, arayüzü dondurmaz."""
     try:
-        s = subprocess.run(["findmnt", "-n", "-o", "FSTYPE", "-T", yol],
-                           capture_output=True, text=True, timeout=10)
-        cikti = s.stdout.strip().splitlines()
-        return cikti[0] if s.returncode == 0 and cikti else ""
-    except (OSError, subprocess.SubprocessError):
+        yol = os.path.normpath(os.path.abspath(yol))
+        en_iyi, tur = "", ""
+        with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as f:
+            for satir in f:
+                sol, ayrac, sag = satir.partition(" - ")
+                if not ayrac:
+                    continue
+                alanlar = sol.split()
+                if len(alanlar) < 5:
+                    continue
+                nokta = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), alanlar[4])
+                if (yol == nokta or yol.startswith(nokta.rstrip("/") + "/")) and len(nokta) >= len(en_iyi):
+                    en_iyi, tur = nokta, sag.split()[0]
+        return tur
+    except (OSError, IndexError):
         return ""
 
 
