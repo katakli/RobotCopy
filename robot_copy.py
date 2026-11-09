@@ -1241,6 +1241,8 @@ class RobotCopyGUI:
         if ilerlemeli:
             self.cikti.mark_set("ilr", "end-1c")
             self.cikti.mark_gravity("ilr", tk.LEFT)
+            self.cikti.tag_configure("ilr_gri", foreground=FG2)
+            self.cikti.insert("ilr", "   başlıyor… (NAS yanıtı bekleniyor)", "ilr_gri")
             self._ilr_aktif = True
         else:
             self._ilr_aktif = False
