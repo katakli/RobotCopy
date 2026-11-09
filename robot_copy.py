@@ -19,6 +19,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import unicodedata
 from datetime import datetime, timedelta
 
@@ -181,7 +182,7 @@ def uzak_mi(yol):
 
 
 def rsync_komutu(kaynak, hedef, mir=True, fft=True, z=True, eta=True,
-                 log_yolu=None, arka_plan=False):
+                 log_yolu=None, arka_plan=False, izinsiz=None):
     if not shutil.which("rsync"):
         raise ValueError("rsync bulunamadı. Kur: sudo pacman -S rsync")
     kaynak = (kaynak or "").strip()
@@ -195,6 +196,12 @@ def rsync_komutu(kaynak, hedef, mir=True, fft=True, z=True, eta=True,
         hedef += "/"
 
     komut = ["rsync", "-a", "--human-readable", "--itemize-changes"]
+    # Ağ paylaşımları (SMB/NFS) Linux izin ve sahiplik bilgisini saklamaz: her çalıştırmada
+    # "izin farklı" diye dosya listelenmesin.
+    if izinsiz is None:
+        izinsiz = not uzak_mi(hedef) and fs_turu(hedef) in AG_DOSYA_SISTEMLERI
+    if izinsiz:
+        komut += ["--no-perms", "--no-owner", "--no-group"]
     if mir:
         komut += ["--delete"]
     if fft:
@@ -1149,11 +1156,15 @@ class RobotCopyGUI:
             tampon = ""
             self._dosya_say = ""
             self._ilr_aktif = False
+            self._durum_taban = "Çalışıyor"
+            self._basla_zaman = self._son_cikti = time.time()
+            self.root.after(0, self._izle)
             self.sayac = {"yeni": 0, "guncel": 0, "silinen": 0, "toplam": None, "veri": None}
             while True:
                 veri = os.read(fd, 4096)
                 if not veri:
                     break
+                self._son_cikti = time.time()
                 tampon += veri.decode("utf-8", "replace")
                 while True:
                     m = re.search(r"[\r\n]", tampon)
@@ -1227,9 +1238,37 @@ class RobotCopyGUI:
         c = getattr(self, "sayac", None) or {}
         if kalan is not None and toplam and int(toplam):
             self._dosya_say = f"  ·  işlenen {int(toplam) - int(kalan)}/{toplam}"
-        self.durum_var.set(f"%{yuzde}  ·  {hiz}  ·  kalan {sure}{getattr(self, '_dosya_say', '')}"
-                           f"   |   yeni {c.get('yeni', 0)} · güncellenen {c.get('guncel', 0)}"
-                           f" · silinen {c.get('silinen', 0)}")
+        self._durum_taban = (f"%{yuzde}  ·  {hiz}  ·  kalan {sure}{getattr(self, '_dosya_say', '')}"
+                             f"   |   yeni {c.get('yeni', 0)} · güncellenen {c.get('guncel', 0)}"
+                             f" · silinen {c.get('silinen', 0)}")
+
+    @staticmethod
+    def _yazma_kuyrugu_mb():
+        """Bellekte olup henüz diske/NAS'a yazılmamış veri (MB). Okunamazsa None."""
+        try:
+            toplam = 0
+            with open("/proc/meminfo") as f:
+                for satir in f:
+                    if satir.startswith(("Dirty:", "Writeback:")):
+                        toplam += int(satir.split()[1])
+            return toplam / 1024
+        except (OSError, ValueError):
+            return None
+
+    def _izle(self):
+        """Çalışırken her saniye durum çubuğunu tazeler: geçen süre, yazma kuyruğu, sessizlik."""
+        if not self.islemiyor:
+            return
+        gecen = int(time.time() - self._basla_zaman)
+        sessiz = int(time.time() - self._son_cikti)
+        parca = [self._durum_taban, f"geçen {gecen // 60}:{gecen % 60:02d}"]
+        kuyruk = self._yazma_kuyrugu_mb()
+        if kuyruk is not None and kuyruk >= 1:
+            parca.append(f"NAS/diske yazılmayı bekleyen {kuyruk:.0f} MB")
+        if sessiz >= 5:
+            parca.append(f"{sessiz} sn çıktı yok (tarama ya da yazma sürüyor)")
+        self.durum_var.set("  ·  ".join(parca))
+        self.root.after(1000, self._izle)
 
     def _rapor_yaz(self):
         c = getattr(self, "sayac", None)
