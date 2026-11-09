@@ -181,6 +181,20 @@ def uzak_mi(yol):
     return re.match(r"^(?:[^/@:\s]+@)?[^/@:\s]+:", yol.strip()) is not None
 
 
+_FSYNC = {}
+
+
+def rsync_fsync_var_mi():
+    """Kurulu rsync --fsync seçeneğini biliyor mu (3.2.4+)?"""
+    if "var" not in _FSYNC:
+        try:
+            cikti = subprocess.run(["rsync", "--help"], capture_output=True, text=True, timeout=10)
+            _FSYNC["var"] = "--fsync" in (cikti.stdout + cikti.stderr)
+        except (OSError, subprocess.SubprocessError):
+            _FSYNC["var"] = False
+    return _FSYNC["var"]
+
+
 def rsync_komutu(kaynak, hedef, mir=True, fft=True, z=True, eta=True,
                  log_yolu=None, arka_plan=False, izinsiz=None):
     if not shutil.which("rsync"):
@@ -202,6 +216,11 @@ def rsync_komutu(kaynak, hedef, mir=True, fft=True, z=True, eta=True,
         izinsiz = not uzak_mi(hedef) and fs_turu(hedef) in AG_DOSYA_SISTEMLERI
     if izinsiz:
         komut += ["--no-perms", "--no-owner", "--no-group"]
+        # Ağ paylaşımına yazılan veri önce bellekte bekler; rsync dosya tarihini ayarladıktan sonra
+        # sunucu veriyi alınca tarihi "şimdi" yapar → dosya her seferinde "değişmiş" görünür.
+        # --fsync veriyi tarih ayarlanmadan önce sunucuya yazdırır.
+        if rsync_fsync_var_mi():
+            komut += ["--fsync"]
     if mir:
         komut += ["--delete"]
     if fft:
