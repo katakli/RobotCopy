@@ -194,7 +194,7 @@ def rsync_komutu(kaynak, hedef, mir=True, fft=True, z=True, eta=True,
     if not hedef.endswith("/"):
         hedef += "/"
 
-    komut = ["rsync", "-a", "--human-readable", "--info=name1"]
+    komut = ["rsync", "-a", "--human-readable", "--itemize-changes"]
     if mir:
         komut += ["--delete"]
     if fft:
@@ -209,6 +209,18 @@ def rsync_komutu(kaynak, hedef, mir=True, fft=True, z=True, eta=True,
         komut += ["-e", "ssh -o BatchMode=yes"]   # şifre sorup takılmasın
     komut += [kaynak, hedef]
     return komut
+
+
+def satir_coz(satir):
+    """rsync --itemize-changes satırını (tür, ad) olarak çözer. tür: yeni | guncel | silinen.
+    Klasör ve diğer satırlar için None döner."""
+    m = re.match(r"^\*deleting\s+(.*)$", satir)
+    if m:
+        return ("silinen", m.group(1)) if not m.group(1).endswith("/") else None
+    m = re.match(r"^([<>ch.])([fdLDS])(\S{9}) (.*)$", satir)
+    if not m or m.group(2) != "f" or m.group(1) not in "<>":
+        return None
+    return ("yeni" if "+" in m.group(3) else "guncel"), m.group(4)
 
 
 def fs_turu(yol):
@@ -1133,6 +1145,7 @@ class RobotCopyGUI:
                 komut, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
             fd = self.proses.stdout.fileno()
             tampon = ""
+            self.sayac = {"yeni": 0, "guncel": 0, "silinen": 0}
             while True:
                 veri = os.read(fd, 4096)
                 if not veri:
@@ -1147,8 +1160,19 @@ class RobotCopyGUI:
                     if not satir.strip():
                         continue
                     # rsync ilerleme satırı \r ile gelir → durum çubuğuna yaz
-                    if "%" in satir and ("to-chk" in satir or "xfr#" in satir):
-                        self.root.after(0, self.durum_var.set, satir.strip())
+                    if re.match(r"^\s*[\d.,]+[KMGTkmgt]?B?\s+\d+%", satir):
+                        self.root.after(0, self._ilerleme, satir.strip())
+                        continue
+                    cozum = satir_coz(satir)
+                    if cozum:
+                        tur, ad = cozum
+                        self.sayac[tur] += 1
+                        simge, renk = {"yeni": ("+ yeni      ", GREEN),
+                                       "guncel": ("~ güncel    ", ORANGE),
+                                       "silinen": ("- silindi   ", RED)}[tur]
+                        self.root.after(0, self._yaz, simge + ad + "\n", renk)
+                    elif re.match(r"^[<>ch.]d\S{9} ", satir):
+                        self.root.after(0, self._yaz, "  klasör     " + satir[12:] + "\n", FG2)
                     else:
                         self.root.after(0, self._yaz, satir + "\n")
             self.proses.wait()
@@ -1156,6 +1180,26 @@ class RobotCopyGUI:
         except Exception as e:
             self.root.after(0, self._yaz, f"[HATA] {e}\n", RED)
             self.root.after(0, self._bitis, -99)
+
+    def _ilerleme(self, satir):
+        m = re.search(r"(\d+)%", satir)
+        yuzde = f"%{m.group(1)}  ·  " if m else ""
+        c = getattr(self, "sayac", None) or {}
+        self.durum_var.set(f"{yuzde}yeni {c.get('yeni', 0)} · güncellenen {c.get('guncel', 0)}"
+                           f" · silinen {c.get('silinen', 0)}   |   {satir}")
+
+    def _rapor_yaz(self):
+        c = getattr(self, "sayac", None)
+        if not c:
+            return
+        toplam = c["yeni"] + c["guncel"] + c["silinen"]
+        self._yaz("\n── RAPOR ─────────────────────────\n", FG2)
+        self._yaz(f"  Kopyalanan (yeni) dosya : {c['yeni']}\n", GREEN)
+        self._yaz(f"  Güncellenen dosya       : {c['guncel']}\n", ORANGE)
+        self._yaz(f"  Silinen dosya           : {c['silinen']}\n", RED)
+        if toplam == 0:
+            self._yaz("  Değişiklik yok: hedef kaynakla aynı.\n", FG2)
+        self._yaz("──────────────────────────────────\n", FG2)
 
     def _durdur(self):
         if self.proses and self.islemiyor:
@@ -1170,6 +1214,7 @@ class RobotCopyGUI:
         if kod in (0, 24):   # 24: kopyalama sırasında kaybolan dosyalar, zararsız
             self.durum_var.set(f"Başarıyla tamamlandı (kod {kod}).")
             self._yaz(f"\n[✓] Senkronizasyon tamamlandı (çıkış kodu {kod}).\n", GREEN)
+            self._rapor_yaz()
         elif kod < 0:
             self.durum_var.set("Durduruldu / hata oluştu.")
         else:
