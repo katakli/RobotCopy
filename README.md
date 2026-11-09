@@ -13,6 +13,8 @@
 - Kaynak ve hedef klasör seçimi
 - Ayna modu (`--delete`), devam eden kopyalama (`--partial`), FAT zaman toleransı, ilerleme/kalan süre
 - Canlı çıktı, durdurma düğmesi, isteğe bağlı log dosyası
+- **Kayıtlı yedeklemeler**: kaynak, hedef ve seçenekleri ada kaydet (ör. “Bebek”), listeden seçince hepsi gelsin
+- **Zamanlı yedekleme** (systemd): günlük, haftalık, iki haftalık, aylık; uygulama kapalıyken de çalışır
 - Dahili **ağ paylaşımı bağla / ayır** penceresi (SMB/CIFS, `pkexec` ile yetkilendirme)
 - Koyu tema, tek dosya, ek Python paketi gerektirmez
 
@@ -43,6 +45,18 @@ Uygulama menüsüne eklemek için (yalnızca mevcut kullanıcı için kurar):
 bash install.sh              # kur
 bash install.sh --uninstall  # kaldır
 ```
+
+## Zamanlı yedekleme
+
+Bir yedeklemeyi kaydet, sonra “Zamanla…” ile sıklığı seç. Uygulama `~/.config/systemd/user/` altına bir kullanıcı zamanlayıcısı yazar; arayüz açık olmak zorunda değildir.
+
+- Bilgisayar o saatte kapalıysa kaçan yedek açılışta yapılır (`Persistent=true`).
+- Kullanıcı zamanlayıcıları oturum açıkken çalışır. Oturum kapalıyken de çalışsın istersen: `loginctl enable-linger $USER`
+- İki haftalık: zamanlayıcı her hafta tetiklenir, son başarılı yedekten 14 günden az geçmişse atlanır.
+- Hedef bir ağ paylaşımıysa ve o an bağlı değilse yedek **atlanır** ve bildirim gelir (bağlı olmayan klasöre yanlışlıkla yazılmaz). Paylaşımı kendin bağlamış olmalısın; şifre kaydedilmediği için uygulama kendisi bağlayamaz.
+- Arka plan yedeği şifre soramaz: SSH hedeflerinde anahtar tabanlı giriş gerekir.
+- Komut satırı: `robot-copy --liste`, `robot-copy --profil "Bebek"`
+- Ayarlar `~/.config/robot-copy/profiller.json` içinde tutulur.
 
 ## Hedef türleri
 

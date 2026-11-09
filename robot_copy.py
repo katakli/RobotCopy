@@ -4,15 +4,23 @@
 Klasör yedekleme / senkronizasyon; yerel, SSH veya SMB (ağ paylaşımı) hedefleri.
 Lisans: MIT
 """
-import tkinter as tk
-from tkinter import filedialog, scrolledtext
+try:
+    import tkinter as tk
+    from tkinter import filedialog, scrolledtext
+except ImportError:  # arka planda (zamanlı) çalışırken tkinter gerekmez
+    tk = filedialog = scrolledtext = None
+import argparse
+import hashlib
+import json
 import subprocess
 import threading
 import os
 import re
 import shutil
+import sys
 import tempfile
-from datetime import datetime
+import unicodedata
+from datetime import datetime, timedelta
 
 BG      = "#1a1a1a"
 BG2     = "#242424"
@@ -88,7 +96,362 @@ SIMGE_PNG_32 = (
 
 PENCERE_BASLIK = "Robot Copy"
 PENCERE_EN     = 720
-PENCERE_BOY    = 820
+PENCERE_BOY    = 900
+
+UYGULAMA    = "robot-copy"
+YENI_ETIKET = "(Yeni yedekleme)"
+
+# Zamanlı yedekte hedef bunlardan biri olarak kaydedildiyse ve şu an bağlı değilse yedek atlanır.
+AG_DOSYA_SISTEMLERI = {"cifs", "smb3", "nfs", "nfs4", "fuse.sshfs", "fuse.rclone", "davfs"}
+
+SIKLIKLAR = [("gunluk", "Günlük"), ("haftalik", "Haftalık"),
+             ("iki_haftalik", "İki haftalık"), ("aylik", "Aylık")]
+GUNLER = [("Pazartesi", "Mon"), ("Salı", "Tue"), ("Çarşamba", "Wed"), ("Perşembe", "Thu"),
+          ("Cuma", "Fri"), ("Cumartesi", "Sat"), ("Pazar", "Sun")]
+GUN_TR_EN = dict(GUNLER)
+GUN_EN_TR = {en: tr for tr, en in GUNLER}
+IKI_HAFTA_ESIGI_GUN = 13   # iki haftalıkta: son başarılı yedekten en az bu kadar gün geçmeli
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ÇEKİRDEK — arayüzden bağımsız (zamanlı yedek tkinter olmadan çalışır)
+# ══════════════════════════════════════════════════════════════════
+def _xdg(degisken, varsayilan):
+    return os.environ.get(degisken) or os.path.expanduser(varsayilan)
+
+
+def ayar_dizini():
+    return os.path.join(_xdg("XDG_CONFIG_HOME", "~/.config"), UYGULAMA)
+
+
+def durum_dizini():
+    return os.path.join(_xdg("XDG_STATE_HOME", "~/.local/state"), UYGULAMA)
+
+
+def systemd_dizini():
+    return os.path.join(_xdg("XDG_CONFIG_HOME", "~/.config"), "systemd", "user")
+
+
+def _json_oku(yol):
+    try:
+        with open(yol, encoding="utf-8") as f:
+            veri = json.load(f)
+        return veri if isinstance(veri, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except ValueError:      # bozuk dosya: üzerine yazılmadan önce yedeğini al
+        try:
+            os.replace(yol, yol + ".bozuk")
+        except OSError:
+            pass
+        return {}
+    except OSError:
+        return {}
+
+
+def _json_yaz(yol, veri):
+    os.makedirs(os.path.dirname(yol), exist_ok=True)
+    gecici = yol + ".tmp"
+    with open(gecici, "w", encoding="utf-8") as f:
+        json.dump(veri, f, ensure_ascii=False, indent=2)
+    os.replace(gecici, yol)
+
+
+def profilleri_yukle():
+    return _json_oku(os.path.join(ayar_dizini(), "profiller.json"))
+
+
+def profilleri_kaydet(profiller):
+    _json_yaz(os.path.join(ayar_dizini(), "profiller.json"), profiller)
+
+
+def profil_kimligi(ad):
+    """Birim adlarında kullanılacak güvenli ve ada özgü kimlik (ascii ad + kısa özet)."""
+    cevir = str.maketrans("ıİğĞüÜşŞöÖçÇ", "iIgGuUsSoOcC")
+    ascii_ad = unicodedata.normalize("NFKD", ad.translate(cevir)).encode("ascii", "ignore").decode()
+    temiz = re.sub(r"[^a-z0-9]+", "-", ascii_ad.lower()).strip("-")[:24] or "profil"
+    return f"{temiz}-{hashlib.sha1(ad.encode('utf-8')).hexdigest()[:6]}"
+
+
+def uzak_mi(yol):
+    """kullanıcı@sunucu:/yol ya da sunucu:/yol biçimindeki (SSH) hedef."""
+    return re.match(r"^(?:[^/@:\s]+@)?[^/@:\s]+:", yol.strip()) is not None
+
+
+def rsync_komutu(kaynak, hedef, mir=True, fft=True, z=True, eta=True,
+                 log_yolu=None, arka_plan=False):
+    if not shutil.which("rsync"):
+        raise ValueError("rsync bulunamadı. Kur: sudo pacman -S rsync")
+    kaynak = (kaynak or "").strip()
+    hedef = (hedef or "").strip()
+    if not kaynak or not hedef:
+        raise ValueError("Kaynak ve hedef klasör boş bırakılamaz.")
+
+    # Sondaki "/" kaynağın İÇERİĞİNİ hedefe kopyalar (robocopy davranışı)
+    kaynak = os.path.join(kaynak, "")
+    if not hedef.endswith("/"):
+        hedef += "/"
+
+    komut = ["rsync", "-a", "--human-readable", "--info=name1"]
+    if mir:
+        komut += ["--delete"]
+    if fft:
+        komut += ["--modify-window=2"]
+    if z:
+        komut += ["--partial"]
+    if eta and not arka_plan:
+        komut += ["--info=progress2"]
+    if log_yolu:
+        komut += [f"--log-file={log_yolu}"]
+    if arka_plan and uzak_mi(hedef):
+        komut += ["-e", "ssh -o BatchMode=yes"]   # şifre sorup takılmasın
+    komut += [kaynak, hedef]
+    return komut
+
+
+def fs_turu(yol):
+    """Yolun bulunduğu dosya sisteminin türü (ör. ext4, cifs); bilinmiyorsa ''."""
+    yol = os.path.abspath(yol)
+    while not os.path.exists(yol) and os.path.dirname(yol) != yol:
+        yol = os.path.dirname(yol)
+    try:
+        s = subprocess.run(["findmnt", "-n", "-o", "FSTYPE", "-T", yol],
+                           capture_output=True, text=True, timeout=10)
+        cikti = s.stdout.strip().splitlines()
+        return cikti[0] if s.returncode == 0 and cikti else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def hedef_hazir_mi(profil):
+    """(hazır_mı, neden). Bağlı olmayan ağ paylaşımına yanlışlıkla yazılmasını önler."""
+    hedef = profil.get("hedef", "").strip()
+    if uzak_mi(hedef):
+        return True, ""
+    beklenen = profil.get("hedef_fs", "")
+    if beklenen in AG_DOSYA_SISTEMLERI and fs_turu(hedef) != beklenen:
+        return False, f"Hedef bağlı değil (beklenen: {beklenen}). Ağ paylaşımını bağla."
+    h = hedef.rstrip("/") or "/"
+    if os.path.isdir(h) or os.path.isdir(os.path.dirname(h)):
+        return True, ""
+    return False, "Hedef klasör bulunamadı."
+
+
+def _durum_yolu():
+    return os.path.join(durum_dizini(), "son_calisma.json")
+
+
+def son_calisma(kimlik):
+    deger = _json_oku(_durum_yolu()).get(kimlik)
+    try:
+        return datetime.fromisoformat(deger) if deger else None
+    except (ValueError, TypeError):
+        return None
+
+
+def son_calisma_yaz(kimlik):
+    veri = _json_oku(_durum_yolu())
+    veri[kimlik] = datetime.now().isoformat(timespec="seconds")
+    _json_yaz(_durum_yolu(), veri)
+
+
+# ── zamanlama → systemd ──────────────────────────────────────────
+def zamanlama_dogrula(z):
+    try:
+        saat, dakika = int(z["saat"]), int(z["dakika"])
+        ay_gunu = int(z.get("ay_gunu", 1))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Saat ve dakika sayı olmalı.") from None
+    if z.get("sikllik") not in dict(SIKLIKLAR):
+        raise ValueError("Geçersiz sıklık.")
+    if not 0 <= saat <= 23:
+        raise ValueError("Saat 0–23 arasında olmalı.")
+    if not 0 <= dakika <= 59:
+        raise ValueError("Dakika 0–59 arasında olmalı.")
+    if z["sikllik"] in ("haftalik", "iki_haftalik") and z.get("gun") not in GUN_EN_TR:
+        raise ValueError("Geçersiz gün.")
+    if z["sikllik"] == "aylik" and not 1 <= ay_gunu <= 28:
+        raise ValueError("Ayın günü 1–28 arasında olmalı.")
+
+
+def takvim_ifadesi(z):
+    """systemd OnCalendar ifadesi. İki haftalık: her hafta tetiklenir, 14 günlük aralığı çalıştırıcı denetler."""
+    zamanlama_dogrula(z)
+    sa = f"{int(z['saat']):02d}:{int(z['dakika']):02d}:00"
+    s = z["sikllik"]
+    if s == "gunluk":
+        return f"*-*-* {sa}"
+    if s in ("haftalik", "iki_haftalik"):
+        return f"{z['gun']} *-*-* {sa}"
+    return f"*-*-{int(z['ay_gunu']):02d} {sa}"
+
+
+def zamanlama_ozeti(z):
+    if not z:
+        return "Zamanlama: kapalı"
+    try:
+        zamanlama_dogrula(z)
+    except ValueError:
+        return "Zamanlama: bozuk kayıt"
+    ad = dict(SIKLIKLAR)[z["sikllik"]]
+    saat = f"{int(z['saat']):02d}:{int(z['dakika']):02d}"
+    if z["sikllik"] in ("haftalik", "iki_haftalik"):
+        return f"Zamanlama: {ad}, {GUN_EN_TR[z['gun']]} {saat}"
+    if z["sikllik"] == "aylik":
+        return f"Zamanlama: {ad}, ayın {int(z['ay_gunu'])}. günü {saat}"
+    return f"Zamanlama: {ad}, {saat}"
+
+
+def _sd_alinti(metin):
+    """systemd ExecStart argümanı için tırnak ve kaçış."""
+    return '"' + metin.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
+
+
+def birim_metinleri(ad, kimlik, z, python, betik):
+    aciklama = " ".join(ad.split()).replace("%", "%%")
+    hizmet = (
+        "[Unit]\n"
+        f"Description=Robot Copy yedeklemesi: {aciklama}\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={_sd_alinti(python)} {_sd_alinti(betik)} --kimlik {_sd_alinti(kimlik)}\n"
+    )
+    zamanlayici = (
+        "[Unit]\n"
+        f"Description=Robot Copy zamanlayıcısı: {aciklama}\n\n"
+        "[Timer]\n"
+        f"OnCalendar={takvim_ifadesi(z)}\n"
+        "Persistent=true\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    return hizmet, zamanlayici
+
+
+def birim_adi(ad):
+    return f"{UYGULAMA}-{profil_kimligi(ad)}"
+
+
+def _systemctl(*argumanlar):
+    return subprocess.run(["systemctl", "--user", *argumanlar],
+                          capture_output=True, text=True, timeout=30)
+
+
+def zamanlamayi_uygula(ad, z):
+    """Birim dosyalarını yazıp zamanlayıcıyı etkinleştirir. (başarılı_mı, mesaj) döner."""
+    if not shutil.which("systemctl"):
+        return False, "systemctl bulunamadı (systemd gerekli)."
+    try:
+        kimlik = profil_kimligi(ad)
+        hizmet, zamanlayici = birim_metinleri(ad, kimlik, z, sys.executable, os.path.abspath(__file__))
+        dizin = systemd_dizini()
+        os.makedirs(dizin, exist_ok=True)
+        birim = birim_adi(ad)
+        for uzanti, icerik in ((".service", hizmet), (".timer", zamanlayici)):
+            with open(os.path.join(dizin, birim + uzanti), "w", encoding="utf-8") as f:
+                f.write(icerik)
+        for adim in (("daemon-reload",), ("enable", birim + ".timer"), ("restart", birim + ".timer")):
+            r = _systemctl(*adim)
+            if r.returncode != 0:
+                return False, (r.stderr or r.stdout or f"systemctl {adim[0]} başarısız").strip()
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    return True, "Zamanlayıcı etkinleştirildi."
+
+
+def zamanlamayi_kapat(ad):
+    birim = birim_adi(ad)
+    var_mi = shutil.which("systemctl") is not None
+    try:
+        if var_mi:
+            _systemctl("disable", "--now", birim + ".timer")
+        for uzanti in (".timer", ".service"):
+            try:
+                os.remove(os.path.join(systemd_dizini(), birim + uzanti))
+            except FileNotFoundError:
+                pass
+        if var_mi:
+            _systemctl("daemon-reload")
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    return True, "Zamanlama kapatıldı."
+
+
+# ── arka planda (arayüzsüz) çalıştırma ───────────────────────────
+def bildirim(baslik, govde):
+    if shutil.which("notify-send"):
+        try:
+            subprocess.run(["notify-send", "-a", "Robot Copy", "-i", UYGULAMA, baslik, govde],
+                           timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def zamanli_calistir(kimlik=None, ad=None, kapi=True):
+    """Kayıtlı yedeklemeyi arayüzsüz çalıştırır. Çıkış kodu: 0 başarılı/atlandı, 75 hedef hazır değil, diğerleri hata."""
+    profiller = profilleri_yukle()
+    if ad is None:
+        ad = next((a for a in profiller if profil_kimligi(a) == kimlik), None)
+    if ad is None or ad not in profiller:
+        print(f"Kayıtlı yedekleme bulunamadı: {kimlik or ad}", file=sys.stderr)
+        return 2
+    p = profiller[ad]
+    kimlik = profil_kimligi(ad)
+    z = p.get("zamanlama") or {}
+
+    if kapi and z.get("sikllik") == "iki_haftalik":
+        son = son_calisma(kimlik)
+        if son and datetime.now() - son < timedelta(days=IKI_HAFTA_ESIGI_GUN):
+            print(f"{ad}: iki haftalık aralık dolmadı, bu hafta atlandı.")
+            return 0
+
+    if not os.path.isdir(p.get("kaynak", "")):
+        bildirim(f"{ad}: yedek alınamadı", "Kaynak klasör bulunamadı.")
+        print(f"{ad}: kaynak klasör bulunamadı: {p.get('kaynak')}", file=sys.stderr)
+        return 3
+    hazir, neden = hedef_hazir_mi(p)
+    if not hazir:
+        bildirim(f"{ad}: yedek atlandı", neden)
+        print(f"{ad}: yedek atlandı. {neden}", file=sys.stderr)
+        return 75   # EX_TEMPFAIL: sonraki zamanlamada yeniden denenir
+
+    if p.get("log") and p.get("log_yolu"):
+        log_yolu = p["log_yolu"]
+    else:
+        log_yolu = os.path.join(durum_dizini(), kimlik + ".log")
+    try:
+        os.makedirs(os.path.dirname(log_yolu) or ".", exist_ok=True)
+        komut = rsync_komutu(p["kaynak"], p["hedef"], p.get("mir", True), p.get("fft", True),
+                             p.get("z", True), False, log_yolu, arka_plan=True)
+    except (ValueError, OSError) as e:
+        print(f"{ad}: {e}", file=sys.stderr)
+        bildirim(f"{ad}: yedek alınamadı", str(e))
+        return 1
+    kod = subprocess.run(komut).returncode
+    if kod in (0, 24):   # 24: kopyalama sırasında kaybolan dosyalar, zararsız
+        son_calisma_yaz(kimlik)
+        bildirim(f"{ad}: yedek tamamlandı", "Yedekleme başarıyla bitti.")
+        return 0
+    bildirim(f"{ad}: yedekleme hatası", f"rsync çıkış kodu {kod}. Ayrıntı için log dosyasına bak.")
+    return kod
+
+
+def cli(argv):
+    ap = argparse.ArgumentParser(
+        prog=UYGULAMA,
+        description="Robot Copy — rsync arayüzü. Argümansız çalıştırılırsa arayüz açılır.")
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--kimlik", help="(zamanlayıcı kullanır) profil kimliğiyle arka planda yedekle")
+    g.add_argument("--profil", help="kayıtlı yedeklemeyi adıyla arka planda çalıştır")
+    g.add_argument("--liste", action="store_true", help="kayıtlı yedeklemeleri listele")
+    a = ap.parse_args(argv)
+    if a.liste:
+        for ad, p in sorted(profilleri_yukle().items()):
+            print(f"{ad}\t{zamanlama_ozeti(p.get('zamanlama'))}\t{p.get('kaynak')} -> {p.get('hedef')}")
+        return 0
+    if a.profil:
+        return zamanli_calistir(ad=a.profil, kapi=False)
+    return zamanli_calistir(kimlik=a.kimlik)
 
 
 class RobotCopyGUI:
@@ -100,7 +463,8 @@ class RobotCopyGUI:
             self.root.iconphoto(True, *self._simgeler)
         except tk.TclError:
             pass  # PNG desteklemeyen eski Tk: varsayılan simge kalır
-        self.root.geometry(f"{PENCERE_EN}x{PENCERE_BOY}")
+        yukseklik = min(PENCERE_BOY, max(680, self.root.winfo_screenheight() - 80))
+        self.root.geometry(f"{PENCERE_EN}x{yukseklik}")
         self.root.resizable(True, True)
         self.root.minsize(560, 680)
         self.root.configure(bg=BG)
@@ -118,6 +482,8 @@ class RobotCopyGUI:
 
         self.islemiyor = False
         self.proses    = None
+        self.profil_ad    = tk.StringVar(value=YENI_ETIKET)
+        self.profil_bilgi = tk.StringVar(value="")
 
         self._arayuz_olustur()
 
@@ -161,12 +527,15 @@ class RobotCopyGUI:
                         bg=BG3, fg=FG, insertbackground=ACCENT,
                         relief=tk.FLAT, highlightthickness=1,
                         highlightbackground=BORDER, highlightcolor=ACCENT,
+                        disabledbackground=BG2, disabledforeground=FG2,
                         font=("Sans", 9))
 
-    def _button(self, master, text, command, accent=False, state=tk.NORMAL, width=None):
+    def _button(self, master, text, command, accent=False, state="normal", width=None):
         kw = dict(text=text, command=command, state=state,
                   relief=tk.FLAT, cursor="hand2",
-                  font=("Sans", 9), padx=12, pady=5, borderwidth=0)
+                  font=("Sans", 9), padx=12, pady=5, borderwidth=0,
+                  highlightthickness=1, highlightbackground=master.cget("bg"),
+                  highlightcolor=ACCENT)
         if width:
             kw["width"] = width
         if accent:
@@ -179,7 +548,9 @@ class RobotCopyGUI:
         return tk.Checkbutton(master, text=text, variable=variable,
                               bg=BG2, fg=FG, selectcolor=BG3,
                               activebackground=BG2, activeforeground=FG,
-                              font=("Sans", 9), relief=tk.FLAT, borderwidth=0)
+                              font=("Sans", 9), relief=tk.FLAT, borderwidth=0,
+                              highlightthickness=1, highlightbackground=master.cget("bg"),
+                              highlightcolor=ACCENT)
 
     def _section(self, master, row, title):
         fr = tk.Frame(master, bg=BG)
@@ -207,15 +578,39 @@ class RobotCopyGUI:
         tk.Label(hdr, text="Robot Copy",
                  bg=BG, fg=FG, font=("Sans", 12, "bold")).pack(side=tk.LEFT, anchor="w")
 
+        # Kayıtlı yedeklemeler
+        self._section(main, 1, "KAYITLI YEDEKLEMELER")
+        pk = self._card(main, 2)
+        sat = tk.Frame(pk, bg=BG2)
+        sat.grid(row=0, column=0, sticky="ew")
+        sat.columnconfigure(0, weight=1)
+        self.profil_menu = tk.OptionMenu(sat, self.profil_ad, YENI_ETIKET)
+        self.profil_menu.config(bg=BG3, fg=FG, activebackground=BORDER, activeforeground=FG,
+                                relief=tk.FLAT, borderwidth=0, highlightthickness=1,
+                                highlightbackground=BORDER, highlightcolor=ACCENT,
+                                font=("Sans", 9), anchor="w", padx=10, pady=5, cursor="hand2")
+        self.profil_menu["menu"].config(bg=BG3, fg=FG, activebackground=ACCENT,
+                                        activeforeground="#1a1a1a", borderwidth=0,
+                                        font=("Sans", 9))
+        self.profil_menu.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._button(sat, "Kaydet", self._profil_kaydet).grid(row=0, column=1, padx=(0, 6))
+        self._button(sat, "Zamanla…", self._zamanla_dialog).grid(row=0, column=2, padx=(0, 6))
+        self._button(sat, "Sil", self._profil_sil).grid(row=0, column=3)
+        tk.Label(pk, textvariable=self.profil_bilgi, bg=BG2, fg=FG2, font=("Sans", 8),
+                 wraplength=640, justify="left", anchor="w").grid(
+            row=1, column=0, sticky="ew", pady=(6, 0))
+        self._profil_menusu_yenile()
+        self._profil_bilgi_guncelle()
+
         # Kaynak
-        self._section(main, 1, "KAYNAK KLASÖR")
-        kk = self._card(main, 2)
+        self._section(main, 3, "KAYNAK KLASÖR")
+        kk = self._card(main, 4)
         self._entry(kk, self.kaynak_yol).grid(row=0, column=0, sticky="ew", ipady=4, padx=(0, 8))
         self._button(kk, "  Gözat", lambda: self._klasor_sec(self.kaynak_yol)).grid(row=0, column=1)
 
         # Hedef
-        self._section(main, 3, "HEDEF KLASÖR")
-        hk = self._card(main, 4)
+        self._section(main, 5, "HEDEF KLASÖR")
+        hk = self._card(main, 6)
         self._entry(hk, self.hedef_yol).grid(row=0, column=0, sticky="ew", ipady=4, padx=(0, 8))
         self._button(hk, "  Gözat", lambda: self._klasor_sec(self.hedef_yol)).grid(row=0, column=1)
         self._button(hk, "Ağ paylaşımı…", self._ag_dialog).grid(row=0, column=2, padx=(8, 0))
@@ -224,8 +619,8 @@ class RobotCopyGUI:
                                                           sticky="w", pady=(6, 0))
 
         # Seçenekler
-        self._section(main, 5, "SEÇENEKLER")
-        opt = self._card(main, 6)
+        self._section(main, 7, "SEÇENEKLER")
+        opt = self._card(main, 8)
         opt.columnconfigure(0, weight=1)
         opt.columnconfigure(2, weight=1)
 
@@ -250,7 +645,7 @@ class RobotCopyGUI:
 
         # Butonlar
         btn_card = tk.Frame(main, bg=BG)
-        btn_card.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 4))
+        btn_card.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(10, 4))
         btn_card.columnconfigure(0, weight=1)
 
         self.basla_btn = self._button(btn_card, "▷   Yedeklemeyi başlat", self._baslat, accent=True)
@@ -263,11 +658,11 @@ class RobotCopyGUI:
         # Durum
         self.durum_var = tk.StringVar(value="Hazır.")
         tk.Label(main, textvariable=self.durum_var, bg=BG, fg=FG2,
-                 font=("Sans", 8)).grid(row=8, column=0, columnspan=3, sticky="w", pady=(2, 4))
+                 font=("Sans", 8)).grid(row=10, column=0, columnspan=3, sticky="w", pady=(2, 4))
 
         # Çıktı
-        self._section(main, 9, "ÇIKTI")
-        main.rowconfigure(10, weight=1)
+        self._section(main, 11, "ÇIKTI")
+        main.rowconfigure(12, weight=1)
         self.cikti = scrolledtext.ScrolledText(
             main, height=20, font=("Monospace", 9),
             bg=BG2, fg=FG, insertbackground=ACCENT,
@@ -275,7 +670,12 @@ class RobotCopyGUI:
             relief=tk.FLAT, highlightthickness=1,
             highlightbackground=BORDER,
             state=tk.DISABLED, wrap=tk.WORD)
-        self.cikti.grid(row=10, column=0, columnspan=3, sticky="nsew")
+        self.cikti.grid(row=12, column=0, columnspan=3, sticky="nsew")
+        try:   # koyu temaya uyumlu kaydırma çubuğu
+            self.cikti.vbar.config(bg=BG3, troughcolor=BG2, activebackground=BORDER,
+                                   highlightthickness=0, borderwidth=0, relief=tk.FLAT)
+        except tk.TclError:
+            pass
 
         self._log_toggle()
 
@@ -286,6 +686,272 @@ class RobotCopyGUI:
         yol = filedialog.askdirectory(initialdir=baslangic)
         if yol:
             degisken.set(os.path.normpath(yol))
+
+    # ── KAYITLI YEDEKLEMELER ───────────────────────────
+    def _profil_verisi(self):
+        hedef = self.hedef_yol.get().strip()
+        return {
+            "kaynak": self.kaynak_yol.get().strip(),
+            "hedef": hedef,
+            "hedef_fs": "" if uzak_mi(hedef) else fs_turu(hedef),
+            "mir": self.opt_mir.get(), "fft": self.opt_fft.get(),
+            "z": self.opt_z.get(), "eta": self.opt_eta.get(),
+            "log": self.opt_log.get(), "log_yolu": self.log_yolu.get().strip(),
+            "zamanlama": None,
+        }
+
+    def _profil_menusu_yenile(self):
+        menu = self.profil_menu["menu"]
+        menu.delete(0, "end")
+        menu.add_command(label=YENI_ETIKET, command=lambda: self._profil_sec(YENI_ETIKET))
+        for ad in sorted(profilleri_yukle(), key=str.casefold):
+            menu.add_command(label=ad, command=lambda a=ad: self._profil_sec(a))
+
+    def _profil_bilgi_guncelle(self):
+        ad = self.profil_ad.get()
+        if ad == YENI_ETIKET:
+            self.profil_bilgi.set("Kaynak ve hedefi seçip “Kaydet” ile kayıtlı bir yedekleme oluştur.")
+            return
+        p = profilleri_yukle().get(ad) or {}
+        metin = zamanlama_ozeti(p.get("zamanlama"))
+        son = son_calisma(profil_kimligi(ad))
+        if son:
+            metin += f"   ·   Son arka plan yedeği: {son:%d.%m.%Y %H:%M}"
+        self.profil_bilgi.set(metin)
+
+    def _profil_sec(self, ad):
+        self.profil_ad.set(ad)
+        p = profilleri_yukle().get(ad) if ad != YENI_ETIKET else None
+        if p:
+            self.kaynak_yol.set(p.get("kaynak", ""))
+            self.hedef_yol.set(p.get("hedef", ""))
+            self.opt_mir.set(bool(p.get("mir", True)))
+            self.opt_fft.set(bool(p.get("fft", True)))
+            self.opt_z.set(bool(p.get("z", True)))
+            self.opt_eta.set(bool(p.get("eta", True)))
+            self.opt_log.set(bool(p.get("log", True)))
+            if p.get("log_yolu"):
+                self.log_yolu.set(p["log_yolu"])
+            self._log_toggle()
+        self._profil_bilgi_guncelle()
+
+    def _ad_sor(self, baslik, baslangic=""):
+        dlg = tk.Toplevel(self.root)
+        dlg.title(baslik)
+        dlg.configure(bg=BG2)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        sonuc = {"ad": None}
+        var = tk.StringVar(value=baslangic)
+        tk.Label(dlg, text="Yedeklemenin adı (ör. Bebek):", bg=BG2, fg=FG,
+                 font=("Sans", 9)).pack(padx=16, pady=(16, 4), anchor="w")
+        giris = self._entry(dlg, var)
+        giris.config(width=36)
+        giris.pack(padx=16, fill=tk.X, ipady=4)
+
+        def tamam(_=None):
+            sonuc["ad"] = " ".join(var.get().split())
+            dlg.destroy()
+
+        bf = tk.Frame(dlg, bg=BG2)
+        bf.pack(padx=16, pady=14, anchor="e")
+        self._button(bf, "İptal", dlg.destroy).pack(side=tk.LEFT, padx=(0, 8))
+        self._button(bf, "Kaydet", tamam, accent=True).pack(side=tk.LEFT)
+        dlg.bind("<Return>", tamam)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        giris.focus_set()
+        giris.select_range(0, tk.END)
+        self.root.wait_window(dlg)
+        return sonuc["ad"]
+
+    def _onay_sor(self, metin, evet="Sil"):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Onay")
+        dlg.configure(bg=BG2)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        sonuc = {"evet": False}
+        tk.Label(dlg, text=metin, bg=BG2, fg=FG, font=("Sans", 9), wraplength=360,
+                 justify="left").pack(padx=18, pady=(18, 8), anchor="w")
+
+        def tamam(_=None):
+            sonuc["evet"] = True
+            dlg.destroy()
+
+        bf = tk.Frame(dlg, bg=BG2)
+        bf.pack(padx=18, pady=(6, 16), anchor="e")
+        self._button(bf, "İptal", dlg.destroy).pack(side=tk.LEFT, padx=(0, 8))
+        self._button(bf, evet, tamam, accent=True).pack(side=tk.LEFT)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        self.root.wait_window(dlg)
+        return sonuc["evet"]
+
+    def _profil_kaydet(self):
+        veri = self._profil_verisi()
+        if not veri["kaynak"] or not veri["hedef"]:
+            self.profil_bilgi.set("Kaydetmek için kaynak ve hedef klasörü doldur.")
+            return
+        mevcut = self.profil_ad.get()
+        ad = self._ad_sor("Yedeklemeyi kaydet", "" if mevcut == YENI_ETIKET else mevcut)
+        if not ad:
+            return
+        profiller = profilleri_yukle()
+        if ad in profiller and ad != mevcut:
+            if not self._onay_sor(f"“{ad}” zaten kayıtlı. Üzerine yazılsın mı?", "Üzerine yaz"):
+                return
+        veri["zamanlama"] = (profiller.get(ad) or {}).get("zamanlama")
+        profiller[ad] = veri
+        try:
+            profilleri_kaydet(profiller)
+        except OSError as e:
+            self.profil_bilgi.set(f"Kaydedilemedi: {e}")
+            return
+        self.profil_ad.set(ad)
+        self._profil_menusu_yenile()
+        self._profil_bilgi_guncelle()
+        self._yaz(f"[✓] Yedekleme kaydedildi: {ad}\n", GREEN)
+
+    def _profil_sil(self):
+        ad = self.profil_ad.get()
+        if ad == YENI_ETIKET:
+            return
+        if not self._onay_sor(f"“{ad}” kayıtlı yedeklemesi (varsa zamanlaması da) silinsin mi?"):
+            return
+        profiller = profilleri_yukle()
+        if (profiller.get(ad) or {}).get("zamanlama"):
+            zamanlamayi_kapat(ad)
+        profiller.pop(ad, None)
+        try:
+            profilleri_kaydet(profiller)
+        except OSError as e:
+            self.profil_bilgi.set(f"Silinemedi: {e}")
+            return
+        self.profil_ad.set(YENI_ETIKET)
+        self._profil_menusu_yenile()
+        self._profil_bilgi_guncelle()
+        self._yaz(f"[✓] Yedekleme silindi: {ad}\n", GREEN)
+
+    def _zamanla_dialog(self):
+        ad = self.profil_ad.get()
+        profiller = profilleri_yukle()
+        if ad == YENI_ETIKET or ad not in profiller:
+            self.profil_bilgi.set("Önce yedeklemeyi “Kaydet” ile kaydet, sonra zamanla.")
+            return
+        if getattr(self, "_zamanla_pencere", None) and self._zamanla_pencere.winfo_exists():
+            self._zamanla_pencere.lift()
+            return
+        z = profiller[ad].get("zamanlama") or {}
+        dlg = tk.Toplevel(self.root)
+        self._zamanla_pencere = dlg
+        dlg.title(f"Zamanla — {ad}")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+
+        sik = tk.StringVar(value=z.get("sikllik", "gunluk"))
+        saat = tk.IntVar(value=int(z.get("saat", 23)))
+        dak = tk.IntVar(value=int(z.get("dakika", 0)))
+        gun = tk.StringVar(value=GUN_EN_TR.get(z.get("gun"), "Pazartesi"))
+        ay = tk.IntVar(value=int(z.get("ay_gunu", 1)))
+        durum = tk.StringVar(value=zamanlama_ozeti(z or None))
+
+        kart = tk.Frame(dlg, bg=BG2, padx=14, pady=12)
+        kart.pack(fill=tk.X, padx=14, pady=(14, 6))
+        tk.Label(kart, text="SIKLIK", bg=BG2, fg=ACCENT,
+                 font=("Sans", 8, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
+        for i, (anahtar, etiket) in enumerate(SIKLIKLAR):
+            tk.Radiobutton(kart, text=etiket, value=anahtar, variable=sik,
+                           bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2,
+                           activeforeground=FG, highlightthickness=0, borderwidth=0,
+                           font=("Sans", 9)).grid(row=1, column=i, sticky="w", padx=(0, 12), pady=(4, 0))
+
+        def spin(ust, var, alt, ust_sinir):
+            sb = tk.Spinbox(ust, from_=alt, to=ust_sinir, textvariable=var, width=4, wrap=True,
+                            bg=BG3, fg=FG, insertbackground=ACCENT, buttonbackground=BORDER,
+                            relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER,
+                            highlightcolor=ACCENT, disabledbackground=BG2, disabledforeground=FG2,
+                            font=("Sans", 9))
+            sb.pack(side=tk.LEFT)
+            return sb
+
+        zr = tk.Frame(kart, bg=BG2)
+        zr.grid(row=2, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        tk.Label(zr, text="Saat:", bg=BG2, fg=FG2, font=("Sans", 9)).pack(side=tk.LEFT, padx=(0, 4))
+        spin(zr, saat, 0, 23)
+        tk.Label(zr, text=":", bg=BG2, fg=FG2).pack(side=tk.LEFT, padx=2)
+        spin(zr, dak, 0, 59)
+        tk.Label(zr, text="Gün:", bg=BG2, fg=FG2, font=("Sans", 9)).pack(side=tk.LEFT, padx=(18, 4))
+        gun_menu = tk.OptionMenu(zr, gun, *[t for t, _ in GUNLER])
+        gun_menu.config(bg=BG3, fg=FG, activebackground=BORDER, activeforeground=FG,
+                        disabledforeground=FG2, relief=tk.FLAT, borderwidth=0,
+                        highlightthickness=1, highlightbackground=BORDER,
+                        font=("Sans", 9), width=9, anchor="w")
+        gun_menu["menu"].config(bg=BG3, fg=FG, activebackground=ACCENT,
+                                activeforeground="#1a1a1a", borderwidth=0, font=("Sans", 9))
+        gun_menu.pack(side=tk.LEFT)
+        tk.Label(zr, text="Ayın günü:", bg=BG2, fg=FG2, font=("Sans", 9)).pack(side=tk.LEFT, padx=(18, 4))
+        ay_spin = spin(zr, ay, 1, 28)
+
+        def alanlari_guncelle(*_):
+            s = sik.get()
+            gun_menu.config(state="normal" if s in ("haftalik", "iki_haftalik") else "disabled")
+            ay_spin.config(state="normal" if s == "aylik" else "disabled")
+
+        sik.trace_add("write", alanlari_guncelle)
+        alanlari_guncelle()
+
+        tk.Label(dlg, text=("İki haftalık: zamanlayıcı her hafta çalışır, son yedekten 14 gün geçmişse yedek alır.\n"
+                            "Bilgisayar o saatte kapalıysa kaçan yedek, oturum açıldığında yapılır.\n"
+                            "Hedef bir ağ paylaşımıysa ve bağlı değilse yedek atlanır, bildirimle haber verilir."),
+                 bg=BG, fg=FG2, font=("Sans", 8), justify="left",
+                 wraplength=470).pack(anchor="w", padx=16, pady=(2, 0))
+
+        def uygula():
+            zam = {"sikllik": sik.get(), "gun": GUN_TR_EN.get(gun.get(), "Mon")}
+            try:
+                zam.update(saat=saat.get(), dakika=dak.get(), ay_gunu=ay.get())
+                zamanlama_dogrula(zam)
+            except tk.TclError:
+                durum.set("Saat, dakika ve gün sayı olmalı.")
+                return
+            except ValueError as e:
+                durum.set(str(e))
+                return
+            ok, mesaj = zamanlamayi_uygula(ad, zam)
+            if ok:
+                kayitlar = profilleri_yukle()
+                if ad in kayitlar:
+                    kayitlar[ad]["zamanlama"] = zam
+                    profilleri_kaydet(kayitlar)
+                durum.set(zamanlama_ozeti(zam) + " — etkinleştirildi.")
+                self._yaz(f"[✓] {ad}: {zamanlama_ozeti(zam)}\n", GREEN)
+            else:
+                durum.set(f"Etkinleştirilemedi: {mesaj}")
+                self._yaz(f"[HATA] Zamanlama: {mesaj}\n", RED)
+            self._profil_bilgi_guncelle()
+
+        def kapat():
+            ok, mesaj = zamanlamayi_kapat(ad)
+            if ok:
+                kayitlar = profilleri_yukle()
+                if ad in kayitlar:
+                    kayitlar[ad]["zamanlama"] = None
+                    profilleri_kaydet(kayitlar)
+                durum.set("Zamanlama kapatıldı.")
+                self._yaz(f"[✓] {ad}: zamanlama kapatıldı.\n", GREEN)
+            else:
+                durum.set(f"Kapatılamadı: {mesaj}")
+            self._profil_bilgi_guncelle()
+
+        bf = tk.Frame(dlg, bg=BG)
+        bf.pack(fill=tk.X, padx=14, pady=(10, 4))
+        bf.columnconfigure(0, weight=1)
+        self._button(bf, "Etkinleştir", uygula, accent=True).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6))
+        self._button(bf, "Zamanlamayı kapat", kapat).grid(row=0, column=1, padx=(0, 6))
+        self._button(bf, "Kapat", dlg.destroy).grid(row=0, column=2)
+        tk.Label(dlg, textvariable=durum, bg=BG, fg=ORANGE, font=("Sans", 9),
+                 wraplength=470, justify="left").pack(anchor="w", padx=16, pady=(4, 14))
 
     # ── AĞ PAYLAŞIMI (SMB/CIFS) BAĞLA / AYIR ───────────
     def _ag_dialog(self):
@@ -426,27 +1092,10 @@ class RobotCopyGUI:
         self.log_entry.config(state=tk.NORMAL if self.opt_log.get() else tk.DISABLED)
 
     def _komut_olustur(self):
-        if not shutil.which("rsync"):
-            raise ValueError("rsync bulunamadı. Kur: sudo pacman -S rsync")
-        kaynak = self.kaynak_yol.get().strip()
-        hedef  = self.hedef_yol.get().strip()
-        if not kaynak or not hedef:
-            raise ValueError("Kaynak ve hedef klasör boş bırakılamaz.")
-
-        # Sondaki "/" kaynağın İÇERİĞİNİ hedefe kopyalar (robocopy davranışı)
-        kaynak = os.path.join(kaynak, "")
-        if not hedef.endswith("/"):
-            hedef += "/"
-
-        komut = ["rsync", "-a", "--human-readable", "--info=name1"]
-        if self.opt_mir.get(): komut += ["--delete"]
-        if self.opt_fft.get(): komut += ["--modify-window=2"]
-        if self.opt_z.get():   komut += ["--partial"]
-        if self.opt_eta.get(): komut += ["--info=progress2"]
-        if self.opt_log.get() and self.log_yolu.get().strip():
-            komut += [f"--log-file={self.log_yolu.get().strip()}"]
-        komut += [kaynak, hedef]
-        return komut
+        log = self.log_yolu.get().strip() if self.opt_log.get() else None
+        return rsync_komutu(self.kaynak_yol.get(), self.hedef_yol.get(),
+                            self.opt_mir.get(), self.opt_fft.get(), self.opt_z.get(),
+                            self.opt_eta.get(), log)
 
     def _baslat(self):
         if self.islemiyor:
@@ -535,6 +1184,10 @@ class RobotCopyGUI:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        sys.exit(cli(sys.argv[1:]))
+    if tk is None:
+        sys.exit("tkinter bulunamadı. Kur: sudo pacman -S tk")
     kok = tk.Tk()
     RobotCopyGUI(kok)
     kok.mainloop()
