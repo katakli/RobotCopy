@@ -110,6 +110,8 @@ GUNLER = [("Pazartesi", "Mon"), ("Salı", "Tue"), ("Çarşamba", "Wed"), ("Perş
           ("Cuma", "Fri"), ("Cumartesi", "Sat"), ("Pazar", "Sun")]
 GUN_TR_EN = dict(GUNLER)
 GUN_EN_TR = {en: tr for tr, en in GUNLER}
+SISTEM_KLASORLERI = {"/", "/home", "/root", "/usr", "/etc", "/var", "/bin", "/sbin", "/lib",
+                     "/boot", "/dev", "/proc", "/sys", "/run", "/tmp", "/opt", "/mnt", "/media"}
 IKI_HAFTA_ESIGI_GUN = 13   # iki haftalıkta: son başarılı yedekten en az bu kadar gün geçmeli
 
 
@@ -1040,8 +1042,19 @@ class RobotCopyGUI:
     def _ag_baglan(self, sunucu, paylasim, kullanici, sifre, baglama, durum):
         s, p, k = sunucu.get().strip(), paylasim.get().strip(), kullanici.get().strip()
         pw, mnt = sifre.get(), baglama.get().strip()
+        # Yazım hatalarını düzelt: "smb://", baştaki/sondaki "/" ve "\\" işaretleri
+        s = re.sub(r"^(smb:)?[/\\]+", "", s).strip("/\\ ")
+        p = p.replace("\\", "/").strip("/ ")
+        paylasim.set(p)
+        sunucu.set(s)
         if not (s and p and k and mnt):
             durum.set("Sunucu, paylaşım, kullanıcı ve bağlama klasörü boş bırakılamaz.")
+            return
+        if "/" in s:
+            durum.set("Sunucu alanına yalnızca adres yaz (ör. 192.168.3.180).")
+            return
+        if not mnt.startswith("/") or os.path.normpath(mnt) in SISTEM_KLASORLERI:
+            durum.set("Bağlama klasörü olarak sistem klasörü kullanılamaz. Boş bir klasör yaz (ör. /mnt/nas).")
             return
         if not shutil.which("pkexec"):
             durum.set("pkexec bulunamadı (polkit kurulu olmalı).")
