@@ -33,6 +33,59 @@ LOGO_ACIK  = "#7cc4ff"
 LOGO_GOZ   = "#e8f4ff"
 LOGO_PUPIL = "#0b1f4d"
 
+# Pencere / görev çubuğu simgesi (assets/robot-copy.svg'den üretilmiş PNG, base64)
+SIMGE_PNG_64 = (
+    "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"
+    "Aut6cmm04HmyAAAAAElFTkSuQmCC"
+)
+SIMGE_PNG_32 = (
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAABmJLR0QA/wD/AP+gvaeTAAADG0lE"
+    "QVRYhe1WS0tVURT+1j4vu/nWfJs5KDVpUjaQdGCjIDIrqlFBEVQ0qaBBpHCpZgZFED0G0Q8Isowa"
+    "WBSlYaEUVniDIl+JhWFi3ujuc85qoNZ9HG/n3BtR4Dfa7LX293177bXPPsD/DH83p/u7OT0ZDjWZ"
+    "xaaJ8wwwgD2JclCiC0908WZitM2ybD+9jq7/NQPHH/ESReAlgPzZqXFVYpW/gca8colEDCgKroaJ"
+    "A0CuVHENzJ435NlAcxevB6MQQC8D0wxMA+glQm7zEzR45UsKzZ3c09zJPclwJHQEfxK/vYbLmt5n"
+    "SjNUpqh2TO7HD0EfACxt6l8THbNMYWqqPjjQVv4lHv+8TbN0Y18Wa8YFMO8EJ1gpIhvg24q09g/c"
+    "qXa8IY4Gijb1+DQl7bWaohVml2Ubmk8DkbcGZ2bIoMTEyERITodGpTVVPdpeE4zOc9yZQmmnFF0t"
+    "yK/MN/TFumdxACAi6It15C3P04WhFiiUdtIpz9EAEe/OKM5IIZHwh/IXlyBkFmakCEG7XBtgGzmq"
+    "ntQzEQHVUGFb9hLH2NygtDFQA+AsZh6XmK1XFQtsWTuTfuOZif5R21McBCptDDwGwCT4yFBbVS8i"
+    "KkDYA6AOQH20eG46oWWrgWwxhlRzBC3bDOSkket4GOoA1DPT3rmJnwaYad6aVxYJGBqw7+Ap7D3g"
+    "h6EBVUXCdTwa4VquDnp4nGEzcOzobrA9Mx4cZ9fxeHBlYHDcxpX7Ejtqa8EALt+TGP5su467MkDg"
+    "mI9EODr6THT0mQnHwxGuFV6B1rDxYVdM3nEuWsuxVUsa35gFlXmKkWpEzK8sEaivVOL+Rj19a+P5"
+    "gBUx9/3rd4wFPlkjtypijtyxB4SCEflNlkUb2LJWxepyJY48UJgVayAUlBACQ075zk1o49Lk6KTf"
+    "l7nIENovwasPJJ69i99cr4YixS1pYfLDRIgtnHHKd6xm9fbX+pRU7xJRXUZxpq77NHh9F9hmhIJy"
+    "Rtzmh0M3KzYAFHM352f1syh5ETgkII7aNkoJHL/20QZAlhAYZgutw+0rLjqJL2AB/wR+ACEaNItp"
+    "9abpAAAAAElFTkSuQmCC"
+)
+
 PENCERE_BASLIK = "Robot Copy"
 PENCERE_EN     = 720
 PENCERE_BOY    = 820
@@ -42,6 +95,11 @@ class RobotCopyGUI:
     def __init__(self, root):
         self.root = root
         self.root.title(PENCERE_BASLIK)
+        try:
+            self._simgeler = [tk.PhotoImage(data=d) for d in (SIMGE_PNG_64, SIMGE_PNG_32)]
+            self.root.iconphoto(True, *self._simgeler)
+        except tk.TclError:
+            pass  # PNG desteklemeyen eski Tk: varsayılan simge kalır
         self.root.geometry(f"{PENCERE_EN}x{PENCERE_BOY}")
         self.root.resizable(True, True)
         self.root.minsize(560, 680)
